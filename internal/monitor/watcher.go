@@ -3,6 +3,7 @@ package monitor
 
 import (
 	"strings"
+	"sync"
 	"syscall"
 	"unsafe"
 )
@@ -48,6 +49,7 @@ type WindowWatcher struct {
 	enumWindowsProc            *syscall.LazyProc
 	getWindowTextProc          *syscall.LazyProc
 	getWindowThreadProcessIdProc *syscall.LazyProc
+	enumCallback               uintptr // 缓存 callback，避免重复创建
 }
 
 // NewWindowWatcher creates a new WindowWatcher instance.
@@ -64,6 +66,7 @@ func NewWindowWatcher() *WindowWatcher {
 // Refresh scans all windows and updates the window list.
 func (w *WindowWatcher) Refresh() ([]*ClaudeWindow, error) {
 	var windows []*ClaudeWindow
+	var windowsMu sync.Mutex // 保护 windows 切片的并发访问
 
 	callback := syscall.NewCallback(func(hwnd uintptr, lParam uintptr) uintptr {
 		title := w.getText(hwnd)
@@ -80,12 +83,14 @@ func (w *WindowWatcher) Refresh() ([]*ClaudeWindow, error) {
 
 		status := detectStatus(title)
 
+		windowsMu.Lock()
 		windows = append(windows, &ClaudeWindow{
 			Handle: hwnd,
 			Title:  title,
 			Status: status,
 			PID:    pid,
 		})
+		windowsMu.Unlock()
 
 		return 1
 	})

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -523,10 +524,12 @@ func refresh() {
 		appState.currentIdx = (appState.currentIdx + 1) % len(newWindows)
 	}
 
-	invalidateRect := user32.NewProc("InvalidateRect")
-	invalidateRect.Call(appState.hwnd, 0, 1)
-
+	// 先释放锁，再触发重绘，避免死锁
 	appState.mu.Unlock()
+
+	// 使用异步方式触发重绘，避免阻塞
+	invalidateRect := user32.NewProc("InvalidateRect")
+	invalidateRect.Call(appState.hwnd, 0, 0) // 使用 0 而不是 1，避免同步重绘
 
 	if notifyWindow != nil {
 		appState.notifier.NotifyWaiting(notifyWindow)
@@ -712,21 +715,32 @@ func onPaint(hwnd uintptr) {
 	getClientRect := user32.NewProc("GetClientRect")
 	getClientRect.Call(hwnd, uintptr(unsafe.Pointer(&rect)))
 
+	// 双缓冲：创建内存 DC 和位图
+	createCompatibleDC := gdi32.NewProc("CreateCompatibleDC")
+	createCompatibleBitmap := gdi32.NewProc("CreateCompatibleBitmap")
+	selectObject := gdi32.NewProc("SelectObject")
+	deleteObject := gdi32.NewProc("DeleteObject")
+	deleteDC := gdi32.NewProc("DeleteDC")
+	bitBlt := gdi32.NewProc("BitBlt")
+
+	memDC, _, _ := createCompatibleDC.Call(hdc)
+	memBitmap, _, _ := createCompatibleBitmap.Call(hdc, uintptr(rect.Right), uintptr(rect.Bottom))
+	oldBitmap, _, _ := selectObject.Call(memDC, memBitmap)
+
+	// 在内存 DC 上绘制
 	createSolidBrush := gdi32.NewProc("CreateSolidBrush")
 	fillRect := user32.NewProc("FillRect")
-	deleteObject := gdi32.NewProc("DeleteObject")
 
 	brush, _, _ := createSolidBrush.Call(0x00202020)
-	fillRect.Call(hdc, uintptr(unsafe.Pointer(&rect)), brush)
+	fillRect.Call(memDC, uintptr(unsafe.Pointer(&rect)), brush)
 	deleteObject.Call(brush)
 
 	setBkMode := gdi32.NewProc("SetBkMode")
 	setTextColor := gdi32.NewProc("SetTextColor")
-	setBkMode.Call(hdc, TRANSPARENT)
+	setBkMode.Call(memDC, TRANSPARENT)
 
 	if appState.font != 0 {
-		selectObject := gdi32.NewProc("SelectObject")
-		selectObject.Call(hdc, appState.font)
+		selectObject.Call(memDC, appState.font)
 	}
 
 	appState.mu.RLock()
@@ -745,26 +759,39 @@ func onPaint(hwnd uintptr) {
 		win := windows[idx]
 		color = getStatusColor(win.Status)
 		statusText := getStatusText(win.Status)
-		title := truncateTitle(win.Title, 35)
+		title := extractTitle(win.Title)
 		text = fmt.Sprintf("[%s] %s", statusText, title)
 	}
 
-	setTextColor.Call(hdc, color)
+	setTextColor.Call(memDC, color)
+
+	// 根据窗口宽度截断文本
+	windowWidth := rect.Right - rect.Left
+	maxTextWidth := int(windowWidth) - 20 // 左右各留10像素边距
+	text = truncateByWidth(memDC, text, maxTextWidth)
 
 	textPtr, _ := syscall.UTF16PtrFromString(text)
 	textLen := len([]rune(text))
 
 	var size SIZE
 	getTextExtentPoint32 := gdi32.NewProc("GetTextExtentPoint32W")
-	getTextExtentPoint32.Call(hdc, uintptr(unsafe.Pointer(textPtr)), uintptr(textLen), uintptr(unsafe.Pointer(&size)))
+	getTextExtentPoint32.Call(memDC, uintptr(unsafe.Pointer(textPtr)), uintptr(textLen), uintptr(unsafe.Pointer(&size)))
 
-	windowWidth := rect.Right - rect.Left
 	windowHeight := rect.Bottom - rect.Top
 	x := (int(windowWidth) - int(size.Cx)) / 2
 	y := (int(windowHeight) - int(size.Cy)) / 2
 
 	textOut := gdi32.NewProc("TextOutW")
-	textOut.Call(hdc, uintptr(x), uintptr(y), uintptr(unsafe.Pointer(textPtr)), uintptr(textLen))
+	textOut.Call(memDC, uintptr(x), uintptr(y), uintptr(unsafe.Pointer(textPtr)), uintptr(textLen))
+
+	// 将内存 DC 复制到屏幕
+	const SRCCOPY = 0x00CC0020
+	bitBlt.Call(hdc, 0, 0, uintptr(rect.Right), uintptr(rect.Bottom), memDC, 0, 0, SRCCOPY)
+
+	// 清理双缓冲资源
+	selectObject.Call(memDC, oldBitmap)
+	deleteObject.Call(memBitmap)
+	deleteDC.Call(memDC)
 }
 
 func getStatusColor(status monitor.ClaudeStatus) uintptr {
@@ -797,10 +824,94 @@ func getStatusText(status monitor.ClaudeStatus) string {
 	}
 }
 
-func truncateTitle(title string, maxLen int) string {
-	runes := []rune(title)
-	if len(runes) <= maxLen {
-		return title
+// extractTitle 从窗口标题中提取项目名称
+// 例如: "⠐ 大东海发挥空间萨芬还是抠脚大汉反抗精神 - Claude Code" -> "大东海发挥空间萨芬还是抠脚大汉反抗精神"
+func extractTitle(title string) string {
+	// 移除开头的 spinner 字符
+	spinners := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "⠐", "⠂", "✳", "●", "○"}
+	for _, s := range spinners {
+		if strings.HasPrefix(title, s) {
+			title = strings.TrimSpace(title[len(s):])
+			break
+		}
 	}
-	return string(runes[:maxLen-3]) + "..."
+
+	// 移除 " - Claude Code" 后缀
+	if idx := strings.LastIndex(title, " - Claude Code"); idx != -1 {
+		title = title[:idx]
+	} else if idx := strings.LastIndex(title, " - Claude Code"); idx != -1 {
+		title = title[:idx]
+	}
+
+	// 移除其他常见后缀
+	suffixes := []string{" - Claude", " — Claude Code", " — Claude"}
+	for _, suffix := range suffixes {
+		if idx := strings.LastIndex(title, suffix); idx != -1 {
+			title = title[:idx]
+			break
+		}
+	}
+
+	return strings.TrimSpace(title)
+}
+
+// truncateByWidth 根据像素宽度截断文本，在末尾添加 "..."
+func truncateByWidth(hdc uintptr, text string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return text
+	}
+
+	getTextExtentPoint32 := gdi32.NewProc("GetTextExtentPoint32W")
+
+	// 先检查完整文本宽度
+	textPtr, _ := syscall.UTF16PtrFromString(text)
+	textLen := len([]rune(text))
+
+	type SIZE struct {
+		Cx int32
+		Cy int32
+	}
+	var size SIZE
+	getTextExtentPoint32.Call(hdc, uintptr(unsafe.Pointer(textPtr)), uintptr(textLen), uintptr(unsafe.Pointer(&size)))
+
+	if int(size.Cx) <= maxWidth {
+		return text
+	}
+
+	// 需要截断，二分查找合适的长度
+	runes := []rune(text)
+	ellipsis := "..."
+	ellipsisLen := len([]rune(ellipsis))
+
+	// 计算省略号宽度
+	ellipsisPtr, _ := syscall.UTF16PtrFromString(ellipsis)
+	var ellipsisSize SIZE
+	getTextExtentPoint32.Call(hdc, uintptr(unsafe.Pointer(ellipsisPtr)), uintptr(ellipsisLen), uintptr(unsafe.Pointer(&ellipsisSize)))
+
+	availableWidth := maxWidth - int(ellipsisSize.Cx)
+	if availableWidth <= 0 {
+		return ellipsis
+	}
+
+	// 二分查找
+	left, right := 0, len(runes)
+	for left < right {
+		mid := (left + right + 1) / 2
+		subText := string(runes[:mid])
+		subPtr, _ := syscall.UTF16PtrFromString(subText)
+		var subSize SIZE
+		getTextExtentPoint32.Call(hdc, uintptr(unsafe.Pointer(subPtr)), uintptr(mid), uintptr(unsafe.Pointer(&subSize)))
+
+		if int(subSize.Cx) <= availableWidth {
+			left = mid
+		} else {
+			right = mid - 1
+		}
+	}
+
+	if left <= 0 {
+		return ellipsis
+	}
+
+	return string(runes[:left]) + ellipsis
 }
