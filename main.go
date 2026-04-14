@@ -63,8 +63,8 @@ const (
 	TPM_RIGHTALIGN  = 0x0008
 	TPM_BOTTOMALIGN = 0x0020
 
-	ID_TRAY_SHOW      = 1001
-	ID_TRAY_EXIT      = 1002
+	ID_TRAY_SHOW       = 1001
+	ID_TRAY_EXIT       = 1002
 	ID_TRAY_OPACITY_25 = 1010
 	ID_TRAY_OPACITY_50 = 1011
 	ID_TRAY_OPACITY_75 = 1012
@@ -265,9 +265,9 @@ func showTrayMenu(hwnd uintptr) {
 	appState.mu.RUnlock()
 
 	opacityOptions := []struct {
-		id     uintptr
-		text   string
-		value  byte
+		id    uintptr
+		text  string
+		value byte
 	}{
 		{ID_TRAY_OPACITY_25, "25%", 64},
 		{ID_TRAY_OPACITY_50, "50%", 128},
@@ -647,19 +647,20 @@ func windowProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 		if len(windows) > 0 {
 			win := windows[currentIdx%len(windows)]
 
+			// 异步执行窗口激活
 			go func(handle uintptr) {
 				appState.highlighter.HighlightWindow(handle)
-
-				appState.mu.Lock()
-				if state, ok := appState.windowStates[handle]; ok {
-					if state.needsConfirm {
-						state.needsConfirm = false
-						state.notified = false
-						state.runningSince = time.Time{}
-					}
-				}
-				appState.mu.Unlock()
 			}(win.Handle)
+
+			appState.mu.Lock()
+			if state, ok := appState.windowStates[win.Handle]; ok {
+				if state.needsConfirm {
+					state.needsConfirm = false
+					state.notified = false
+					state.runningSince = time.Time{}
+				}
+			}
+			appState.mu.Unlock()
 		}
 		return 0
 

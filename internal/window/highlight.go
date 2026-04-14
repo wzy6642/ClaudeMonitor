@@ -20,75 +20,84 @@ func NewHighlighter() *Highlighter {
 
 // HighlightWindow brings a window to the foreground and flashes it.
 func (h *Highlighter) HighlightWindow(hwnd uintptr) error {
-	// First, restore the window if minimized
-	h.showWindow(hwnd, SW_RESTORE)
+	// Check if window is valid
+	isWindow := h.user32.NewProc("IsWindow")
+	valid, _, _ := isWindow.Call(hwnd)
+	if valid == 0 {
+		return nil
+	}
 
-	// Bring to foreground
-	h.setForegroundWindow(hwnd)
+	// 检查窗口是否最小化
+	isIconic := h.user32.NewProc("IsIconic")
+	iconic, _, _ := isIconic.Call(hwnd)
 
-	// Flash the window to draw attention
-	h.flashWindow(hwnd, true)
+	setForegroundWindow := h.user32.NewProc("SetForegroundWindow")
+
+	if iconic != 0 {
+		// 方法1: 使用 OpenIcon 恢复最小化窗口
+		openIcon := h.user32.NewProc("OpenIcon")
+		openIcon.Call(hwnd)
+
+		// 方法2: 发送 WM_SYSCOMMAND SC_RESTORE 消息
+		const WM_SYSCOMMAND = 0x0112
+		const SC_RESTORE = 0xF120
+		sendMessage := h.user32.NewProc("SendMessageW")
+		sendMessage.Call(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0)
+
+		// 方法3: 使用 ShowWindowAsync
+		showWindowAsync := h.user32.NewProc("ShowWindowAsync")
+		showWindowAsync.Call(hwnd, uintptr(SW_RESTORE))
+	}
+
+	// 使用 SetWindowPos 强制显示并置顶
+	setWindowPos := h.user32.NewProc("SetWindowPos")
+	const HWND_TOPMOST = ^uintptr(0) // -1
+	const HWND_TOP = uintptr(0)
+	const SWP_NOSIZE = 0x0001
+	const SWP_NOMOVE = 0x0002
+	const SWP_SHOWWINDOW = 0x0040
+
+	setWindowPos.Call(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW)
+
+	// SetForegroundWindow
+	setForegroundWindow.Call(hwnd)
+
+	// BringWindowToTop
+	bringWindowToTop := h.user32.NewProc("BringWindowToTop")
+	bringWindowToTop.Call(hwnd)
+
+	// 取消 TOPMOST
+	setWindowPos.Call(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE)
+
+	// 闪烁任务栏
+	h.flashWindowEx(hwnd)
 
 	return nil
 }
 
-// showWindow calls the Win32 ShowWindow function.
-func (h *Highlighter) showWindow(hwnd uintptr, cmdShow int) bool {
-	proc := h.user32.NewProc("ShowWindow")
-	ret, _, _ := proc.Call(hwnd, uintptr(cmdShow))
-	return ret != 0
-}
+// flashWindowEx flashes the window's taskbar button.
+func (h *Highlighter) flashWindowEx(hwnd uintptr) {
+	flashWindowEx := h.user32.NewProc("FlashWindowEx")
 
-// setForegroundWindow brings a window to the foreground.
-func (h *Highlighter) setForegroundWindow(hwnd uintptr) bool {
-	// Allow set foreground window permission
-	// This is needed because Windows restricts which processes can set foreground window
-	h.allowSetForegroundWindow()
-
-	proc := h.user32.NewProc("SetForegroundWindow")
-	ret, _, _ := proc.Call(hwnd)
-	return ret != 0
-}
-
-// flashWindow flashes the window's title bar.
-func (h *Highlighter) flashWindow(hwnd uintptr, invert bool) bool {
-	proc := h.user32.NewProc("FlashWindow")
-	var invertVal uintptr
-	if invert {
-		invertVal = 1
+	type FLASHWINFO struct {
+		cbSize    uint32
+		hwnd      uintptr
+		dwFlags   uint32
+		uCount    uint32
+		dwTimeout uint32
 	}
-	ret, _, _ := proc.Call(hwnd, invertVal)
-	return ret != 0
-}
 
-// allowSetForegroundWindow allows the process to set foreground window.
-func (h *Highlighter) allowSetForegroundWindow() {
-	user32 := syscall.NewLazyDLL("user32.dll")
-	proc := user32.NewProc("AllowSetForegroundWindow")
-	// ASFW_ANY = -1, but we need to pass it as unsigned
-	proc.Call(^uintptr(0)) // Allow any process (equivalent to -1)
-}
+	const FLASHW_ALL = 0x00000003
+	const FLASHW_TIMERNOFG = 0x0000000C
 
-// GetWindowRect gets the window's position and size.
-func (h *Highlighter) GetWindowRect(hwnd uintptr) (left, top, right, bottom int32, ok bool) {
-	type RECT struct {
-		Left, Top, Right, Bottom int32
+	info := FLASHWINFO{
+		cbSize:    uint32(unsafe.Sizeof(FLASHWINFO{})),
+		hwnd:      hwnd,
+		dwFlags:   FLASHW_ALL | FLASHW_TIMERNOFG,
+		uCount:    5,
+		dwTimeout: 0,
 	}
-	var rect RECT
-
-	proc := h.user32.NewProc("GetWindowRect")
-	ret, _, _ := proc.Call(hwnd, uintptr(unsafe.Pointer(&rect)))
-	if ret == 0 {
-		return 0, 0, 0, 0, false
-	}
-	return rect.Left, rect.Top, rect.Right, rect.Bottom, true
-}
-
-// IsWindowVisible checks if a window is visible.
-func (h *Highlighter) IsWindowVisible(hwnd uintptr) bool {
-	proc := h.user32.NewProc("IsWindowVisible")
-	ret, _, _ := proc.Call(hwnd)
-	return ret != 0
+	flashWindowEx.Call(uintptr(unsafe.Pointer(&info)))
 }
 
 // Constants for ShowWindow
